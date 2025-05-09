@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>2D Симуляция Жидкости</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            overscroll-behavior: none; /* Предотвращает "pull-to-refresh" на мобильных */
+        }
+        canvas {
+            display: block;
+            cursor: crosshair;
+            touch-action: none; /* Отключает события по умолчанию для сенсорного ввода, такие как панорамирование */
+        }
+        .info-panel {
+            background-color: rgba(255, 255, 255, 0.9);
+            border-radius: 0.5rem;
+            padding: 1rem;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-gray-100 flex flex-col items-center justify-center min-h-screen p-4 overflow-hidden">
+
+    <div class="w-full max-w-2xl mb-4 text-center">
+        <h1 class="text-3xl font-bold text-cyan-400">2D Симуляция Жидкости</h1>
+        <p class="text-gray-400 mt-2">Кликайте и перетаскивайте мышью по холсту, чтобы добавить "краску" и создать потоки.</p>
+    </div>
+
+    <canvas id="fluidCanvas" class="border-2 border-cyan-500 rounded-lg shadow-2xl"></canvas>
+
+    <div class="mt-6 p-4 info-panel text-gray-800 max-w-2xl w-full">
+        <h2 class="text-xl font-semibold mb-2 text-cyan-600">Как это работает:</h2>
+        <ul class="list-disc list-inside space-y-1 text-sm">
+            <li><strong>Сетка:</strong> Симуляция происходит на невидимой сетке. Каждая ячейка сетки содержит информацию о плотности ("краске") и скорости жидкости.</li>
+            <li><strong>Добавление вещества:</strong> Когда вы кликаете и двигаете мышью, в соответствующие ячейки сетки добавляется плотность (визуализируется как цвет) и импульс (влияет на скорость).</li>
+            <li><strong>Шаги симуляции (на каждом кадре):</strong>
+                <ul class="list-disc list-inside ml-4 space-y-1">
+                    <li><strong>Вязкость (Viscosity):</strong> Скорости медленно распространяются на соседние ячейки, имитируя вязкое трение.</li>
+                    <li><strong>Диффузия (Diffusion):</strong> Плотность "краски" также распространяется на соседние ячейки.</li>
+                    <li><strong>Адвекция (Advection):</strong> Плотность и скорости переносятся самой жидкостью в соответствии с полем скоростей.</li>
+                    <li><strong>Проекция (Projection):</strong> Этот шаг корректирует поле скоростей, чтобы жидкость оставалась несжимаемой (сохраняла объем).</li>
+                    <li><strong>Затухание (Decay):</strong> Плотность "краски" постепенно уменьшается со временем.</li>
+                </ul>
+            </li>
+            <li><strong>Отрисовка:</strong> Плотность в каждой ячейке сетки преобразуется в цвет и отображается на холсте.</li>
+        </ul>
+        <button id="resetButton" class="mt-4 w-full bg-cyan-500 hover:bg-cyan-600 text-white font-semibold py-2 px-4 rounded-lg transition duration-150 ease-in-out">
+            Сбросить симуляцию
+        </button>
+    </div>
+
+    <script>
+        // Класс для симуляции жидкости
+        class FluidSim {
+            constructor(size, diffusion, viscosity, dt, iterations = 4) {
+                this.size = size; // Размер сетки (N x N)
+                this.dt = dt;     // Шаг времени
+                this.diff = diffusion; // Коэффициент диффузии
+                this.visc = viscosity; // Коэффициент вязкости
+                this.iterations = iterations; // Количество итераций для солвера
+
+                // Плотность (s - предыдущее/временное, density - текущее)
+                this.s = new Float32Array(size * size).fill(0);
+                this.density = new Float32Array(size * size).fill(0);
+
+                // Скорости (Vx, Vy - текущие; Vx0, Vy0 - предыдущие/временные)
+                this.Vx = new Float32Array(size * size).fill(0);
+                this.Vy = new Float32Array(size * size).fill(0);
+                this.Vx0 = new Float32Array(size * size).fill(0);
+                this.Vy0 = new Float32Array(size * size).fill(0);
+            }
+
+            // Индекс для доступа к 1D массиву как к 2D сетке
+            IX(x, y) {
+                x = Math.max(0, Math.min(x, this.size - 1));
+                y = Math.max(0, Math.min(y, this.size - 1));
+                return x + y * this.size;
+            }
+
+            // Добавление плотности в ячейку
+            addDensity(x, y, amount) {
+                const index = this.IX(x, y);
+                this.density[index] += amount;
+            }
+
+            // Добавление скорости в ячейку
+            addVelocity(x, y, amountX, amountY) {
+                const index = this.IX(x, y);
+                this.Vx[index] += amountX;
+                this.Vy[index] += amountY;
+            }
+
+            // Шаг симуляции
+            step() {
+                const N = this.size;
+                const visc = this.visc;
+                const diff = this.diff;
+                const dt = this.dt;
+                const Vx = this.Vx;
+                const Vy = this.Vy;
+                const Vx0 = this.Vx0;
+                const Vy0 = this.Vy0;
+                const s = this.s;
+                const density = this.density;
+
+                // --- Шаги для скорости ---
+                // 1. Диффузия текущих скоростей (Vx, Vy) во временные массивы (Vx0, Vy0)
+                // (Vx0, Vy0) = Diffuse(Vx, Vy)
+                this.diffuse(1, Vx0, Vx, visc, dt);
+                this.diffuse(2, Vy0, Vy, visc, dt);
+
+                // 2. Проекция этих диффундированных скоростей (Vx0, Vy0). Результат сохраняется в (Vx0, Vy0).
+                // (Vx0, Vy0) = Project(Vx0, Vy0)  [используя Vx, Vy как временные буферы для p, div]
+                this.project(Vx0, Vy0, Vx, Vy); 
+
+                // 3. Адвекция спроецированных диффундированных скоростей (Vx0, Vy0) для получения новых текущих скоростей (Vx, Vy).
+                // Адвекция использует (Vx0, Vy0) как поле скоростей.
+                // (Vx, Vy) = Advect((Vx0, Vy0), by_field=(Vx0,Vy0))
+                this.advect(1, Vx, Vx0, Vx0, Vy0, dt);
+                this.advect(2, Vy, Vy0, Vx0, Vy0, dt);
+
+                // 4. Проекция новых текущих скоростей (Vx, Vy). Результат сохраняется в (Vx, Vy).
+                // (Vx, Vy) = Project(Vx, Vy) [используя Vx0, Vy0 как временные буферы для p, div]
+                this.project(Vx, Vy, Vx0, Vy0);
+
+                // --- Шаги для плотности ---
+                // 1. Диффузия текущей плотности (density) во временный массив (s)
+                // s = Diffuse(density)
+                this.diffuse(0, s, density, diff, dt);
+
+                // 2. Адвекция временной плотности (s) для получения новой текущей плотности (density).
+                // Использует финальные адвектированные и спроецированные скорости (Vx, Vy) как поле.
+                // density = Advect(s, by_field=(Vx,Vy))
+                this.advect(0, density, s, Vx, Vy, dt);
+
+                // --- Затухание плотности ---
+                const decayRate = 0.001; // Коэффициент затухания (0.1% за шаг). Можно настроить.
+                for (let i = 0; i < density.length; i++) {
+                    density[i] *= (1.0 - decayRate); // Применяем затухание
+                    if (density[i] < 0.01) {         // Если плотность очень мала, обнуляем ее
+                        density[i] = 0;
+                    }
+                }
+            }
+
+            // Установка граничных условий
+            set_bnd(b, x) {
+                const N = this.size;
+                // Обработка внутренних границ (от 1 до N-2)
+                for (let i = 1; i < N - 1; i++) {
+                    // Верхняя и нижняя границы
+                    // b=2 для компоненты скорости Y (Vy), отражение скорости
+                    // иначе (b=0 для плотности, b=1 для Vx) копирование значения
+                    x[this.IX(i, 0)] = b === 2 ? -x[this.IX(i, 1)] : x[this.IX(i, 1)];
+                    x[this.IX(i, N - 1)] = b === 2 ? -x[this.IX(i, N - 2)] : x[this.IX(i, N - 2)];
+                    // Левая и правая границы
+                    // b=1 для компоненты скорости X (Vx), отражение скорости
+                    x[this.IX(0, i)] = b === 1 ? -x[this.IX(1, i)] : x[this.IX(1, i)];
+                    x[this.IX(N - 1, i)] = b === 1 ? -x[this.IX(N - 2, i)] : x[this.IX(N - 2, i)];
+                }
+
+                // Угловые точки (среднее от соседей)
+                x[this.IX(0, 0)] = 0.5 * (x[this.IX(1, 0)] + x[this.IX(0, 1)]);
+                x[this.IX(0, N - 1)] = 0.5 * (x[this.IX(1, N - 1)] + x[this.IX(0, N - 2)]);
+                x[this.IX(N - 1, 0)] = 0.5 * (x[this.IX(N - 2, 0)] + x[this.IX(N - 1, 1)]);
+                x[this.IX(N - 1, N - 1)] = 0.5 * (x[this.IX(N - 2, N - 1)] + x[this.IX(N - 1, N - 2)]);
+            }
+
+            // Линейный солвер (метод Гаусса-Зейделя)
+            // b: тип граничного условия
+            // x: массив для решения (выход)
+            // x0: массив исходных значений (вход)
+            // a: коэффициент диффузии/вязкости, умноженный на dt и масштаб сетки
+            // c: знаменатель (1 + 4*a для 2D)
+            lin_solve(b, x, x0, a, c) {
+                const cRecip = 1.0 / c; // Обратное значение c для ускорения вычислений
+                for (let k = 0; k < this.iterations; k++) { // Итерационный процесс
+                    for (let j = 1; j < this.size - 1; j++) { // По внутренним ячейкам сетки
+                        for (let i = 1; i < this.size - 1; i++) {
+                            // Обновление значения ячейки на основе соседей и исходного значения
+                            x[this.IX(i, j)] =
+                                (x0[this.IX(i, j)] +         // Исходное значение
+                                 a * (x[this.IX(i + 1, j)] + // Сосед справа
+                                      x[this.IX(i - 1, j)] + // Сосед слева
+                                      x[this.IX(i, j + 1)] + // Сосед снизу
+                                      x[this.IX(i, j - 1)]   // Сосед сверху
+                                     )) * cRecip;
+                        }
+                    }
+                    this.set_bnd(b, x); // Применение граничных условий после каждой итерации
+                }
+            }
+            
+            // Адвекция (перенос)
+            // b: тип граничного условия
+            // d: массив для результата (выход)
+            // d0: массив исходных значений (вход, то, что переносится)
+            // velocX, velocY: поля скоростей, по которым происходит перенос
+            // dt: шаг времени
+            advect(b, d, d0, velocX, velocY, dt) {
+                let i0, i1, j0, j1; // Целочисленные координаты ячеек для интерполяции
+                let i, j; // Объявление переменных i и j для циклов
+
+                // Масштабированный шаг времени для координат сетки
+                const dtx = dt * (this.size - 2); // (this.size - 2) т.к. работаем с внутренними ячейками
+                const dty = dt * (this.size - 2);
+
+                let s0, s1, t0, t1; // Веса для билинейной интерполяции
+                let tmp1, tmp2, x, y; // Временные переменные для координат
+
+                const N = this.size;
+                let ifloat, jfloat; // Текущие координаты в виде float
+
+                for (j = 1, jfloat = 1; j < N - 1; j++, jfloat++) { // Итерация по внутренним ячейкам (y)
+                    for (i = 1, ifloat = 1; i < N - 1; i++, ifloat++) { // Итерация по внутренним ячейкам (x)
+                        // Вычисляем координаты точки, из которой значение "пришло" в текущую ячейку (i,j)
+                        // двигаясь назад по полю скоростей
+                        tmp1 = dtx * velocX[this.IX(i, j)];
+                        tmp2 = dty * velocY[this.IX(i, j)];
+                        x = ifloat - tmp1; // Координата x источника
+                        y = jfloat - tmp2; // Координата y источника
+
+                        // Ограничиваем координаты источника границами сетки (0.5 до N-1.5 для корректной интерполяции)
+                        if (x < 0.5) x = 0.5;
+                        if (x > N - 1.5) x = N - 1.5; 
+                        i0 = Math.floor(x); // Ближайшая левая/верхняя ячейка
+                        i1 = i0 + 1.0;      // Ближайшая правая/нижняя ячейка
+                        
+                        if (y < 0.5) y = 0.5;
+                        if (y > N - 1.5) y = N - 1.5;
+                        j0 = Math.floor(y);
+                        j1 = j0 + 1.0;
+
+                        // Вычисляем веса для билинейной интерполяции
+                        s1 = x - i0; // Дробная часть координаты x
+                        s0 = 1.0 - s1;
+                        t1 = y - j0; // Дробная часть координаты y
+                        t0 = 1.0 - t1;
+
+                        // Целочисленные индексы для доступа к массиву d0
+                        const i0i = Math.floor(i0);
+                        const i1i = Math.floor(i1);
+                        const j0i = Math.floor(j0);
+                        const j1i = Math.floor(j1);
+                        
+                        // Билинейная интерполяция значения из d0
+                        d[this.IX(i, j)] =
+                            s0 * (t0 * d0[this.IX(i0i, j0i)] + t1 * d0[this.IX(i0i, j1i)]) +
+                            s1 * (t0 * d0[this.IX(i1i, j0i)] + t1 * d0[this.IX(i1i, j1i)]);
+                    }
+                }
+                this.set_bnd(b, d); // Применение граничных условий
+            }
+            
+            // Эти методы переопределяют те, что могли быть выше, и используют правильные коэффициенты для 2D.
+            // Диффузия
+            // b: тип граничного условия
+            // x: массив для решения (выход)
+            // x0: массив исходных значений (вход)
+            // current_diff: коэффициент диффузии/вязкости
+            // dt: шаг времени
+            diffuse(b, x, x0, current_diff_param, dt_param) { 
+                const a = dt_param * current_diff_param * (this.size - 2) * (this.size - 2);
+                this.lin_solve(b, x, x0, a, 1 + 4 * a); // Используем 1+4a для 2D
+            }
+
+            // Проекция (для сохранения несжимаемости поля скоростей)
+            // velocX, velocY: компоненты поля скоростей (вход/выход)
+            // p_scratch, div_scratch: временные массивы для давления (p) и дивергенции (div)
+            project(velocX, velocY, p_scratch, div_scratch) { 
+                const N = this.size;
+                // Вычисление дивергенции поля скоростей
+                for (let j = 1; j < N - 1; j++) {
+                    for (let i = 1; i < N - 1; i++) {
+                        div_scratch[this.IX(i, j)] = -0.5 * (
+                            velocX[this.IX(i + 1, j)] - velocX[this.IX(i - 1, j)] + // (u(i+1,j) - u(i-1,j)) / (2*h)
+                            velocY[this.IX(i, j + 1)] - velocY[this.IX(i, j - 1)]   // (v(i,j+1) - v(i,j-1)) / (2*h)
+                        ) / N; // Деление на N (или размер ячейки h, если он не 1)
+                        p_scratch[this.IX(i, j)] = 0; // Инициализация поля давления нулями
+                    }
+                }
+                this.set_bnd(0, div_scratch); // Граничные условия для дивергенции
+                this.set_bnd(0, p_scratch);   // Граничные условия для давления
+                
+                // Решение уравнения Пуассона для давления: laplacian(p) = div
+                this.lin_solve(0, p_scratch, div_scratch, 1, 4); // Для 2D коэффициент 4
+
+                // Вычитание градиента давления из поля скоростей для обеспечения несжимаемости
+                // u = u - grad(p)_x
+                // v = v - grad(p)_y
+                for (let j = 1; j < N - 1; j++) {
+                    for (let i = 1; i < N - 1; i++) {
+                        velocX[this.IX(i, j)] -= 0.5 * (p_scratch[this.IX(i + 1, j)] - p_scratch[this.IX(i - 1, j)]) * N; // grad(p)_x * N
+                        velocY[this.IX(i, j)] -= 0.5 * (p_scratch[this.IX(i, j + 1)] - p_scratch[this.IX(i, j - 1)]) * N; // grad(p)_y * N
+                    }
+                }
+                this.set_bnd(1, velocX); // Граничные условия для Vx
+                this.set_bnd(2, velocY); // Граничные условия для Vy
+            }
+
+            // Сброс симуляции
+            reset() {
+                this.s.fill(0);
+                this.density.fill(0);
+                this.Vx.fill(0);
+                this.Vy.fill(0);
+                this.Vx0.fill(0);
+                this.Vy0.fill(0);
+            }
+        }
+
+        // Настройки холста и симуляции
+        const canvas = document.getElementById('fluidCanvas');
+        const ctx = canvas.getContext('2d');
+        
+        const GRID_SIZE = 96; // Размер сетки (N)
+        const CANVAS_SCALE = 6; // Масштаб для отрисовки на холсте
+        canvas.width = GRID_SIZE * CANVAS_SCALE;
+        canvas.height = GRID_SIZE * CANVAS_SCALE;
+
+        // Параметры симуляции: размер сетки, коэф. диффузии, коэф. вязкости, шаг времени, кол-во итераций солвера
+        const fluid = new FluidSim(GRID_SIZE, 0.00001, 0.0000001, 0.15, 10); 
+
+        let mouseIsDown = false;
+        let lastMouseX = 0;
+        let lastMouseY = 0;
+        let lastTouchX = 0; // Для сенсорного ввода
+        let lastTouchY = 0; // Для сенсорного ввода
+
+
+        // Получение координат мыши относительно холста
+        function getMousePos(event) {
+            const rect = canvas.getBoundingClientRect();
+            return {
+                x: event.clientX - rect.left,
+                y: event.clientY - rect.top
+            };
+        }
+        
+        // Начало взаимодействия (клик мыши или касание)
+        function handleInteractionStart(canvasX, canvasY) {
+            mouseIsDown = true; // Флаг, что взаимодействие начато
+            const gridX = Math.floor(canvasX / CANVAS_SCALE); // Координаты в сетке
+            const gridY = Math.floor(canvasY / CANVAS_SCALE);
+            lastMouseX = canvasX; // Запоминаем последнюю позицию для расчета дельты
+            lastMouseY = canvasY;
+            // Добавляем плотность в точку клика/касания
+            fluid.addDensity(gridX, gridY, 200); 
+        }
+
+        // Движение мыши или пальца с зажатой кнопкой/касанием
+        function handleInteractionMove(canvasX, canvasY) {
+            if (!mouseIsDown) return; // Если взаимодействие не начато, ничего не делаем
+
+            const gridX = Math.floor(canvasX / CANVAS_SCALE);
+            const gridY = Math.floor(canvasY / CANVAS_SCALE);
+
+            // Добавляем плотность в текущую точку
+            fluid.addDensity(gridX, gridY, 150); 
+
+            // Рассчитываем изменение положения для добавления скорости (импульса)
+            const deltaX = (canvasX - lastMouseX) * 0.5; // Уменьшаем силу для более плавного эффекта
+            const deltaY = (canvasY - lastMouseY) * 0.5;
+            fluid.addVelocity(gridX, gridY, deltaX, deltaY); // Добавляем скорость
+
+            lastMouseX = canvasX; // Обновляем последнюю позицию
+            lastMouseY = canvasY;
+        }
+
+        // Окончание взаимодействия
+        function handleInteractionEnd() {
+            mouseIsDown = false;
+        }
+
+        // --- Обработчики событий мыши ---
+        canvas.addEventListener('mousedown', (e) => {
+            const pos = getMousePos(e);
+            handleInteractionStart(pos.x, pos.y);
+        });
+        canvas.addEventListener('mousemove', (e) => {
+            const pos = getMousePos(e);
+            handleInteractionMove(pos.x, pos.y);
+        });
+        canvas.addEventListener('mouseup', handleInteractionEnd);
+        canvas.addEventListener('mouseleave', handleInteractionEnd); // Если мышь ушла за пределы холста
+
+        // --- Обработчики сенсорных событий ---
+        canvas.addEventListener('touchstart', (e) => {
+            e.preventDefault(); // Предотвращаем стандартное поведение (например, скроллинг)
+            const touch = e.touches[0]; // Берем первое касание
+            const rect = canvas.getBoundingClientRect();
+            // Запоминаем начальные координаты касания
+            lastTouchX = touch.clientX - rect.left;
+            lastTouchY = touch.clientY - rect.top;
+            handleInteractionStart(lastTouchX, lastTouchY); // Вызываем общую функцию начала взаимодействия
+        }, { passive: false }); // passive: false необходимо для preventDefault()
+
+        canvas.addEventListener('touchmove', (e) => {
+            e.preventDefault(); 
+            if (!mouseIsDown) return; // Используем mouseIsDown как общий флаг активности
+            const touch = e.touches[0];
+            const rect = canvas.getBoundingClientRect();
+            const currentTouchX = touch.clientX - rect.left;
+            const currentTouchY = touch.clientY - rect.top;
+            
+            // Интерполяция точек между событиями touchmove для более плавного следа,
+            // так как события touchmove могут приходить реже, чем mousemove.
+            const dx = currentTouchX - lastTouchX;
+            const dy = currentTouchY - lastTouchY;
+            const dist = Math.sqrt(dx*dx + dy*dy);
+            const INTERPOLATION_STEP = CANVAS_SCALE / 2; // Шаг интерполяции
+
+            if (dist > INTERPOLATION_STEP) { // Если дистанция значительная
+                const steps = Math.ceil(dist / INTERPOLATION_STEP);
+                for (let k = 1; k <= steps; k++) { // Используем k чтобы не конфликтовать с i,j из advect
+                    const intermediateX = lastTouchX + dx * (k / steps);
+                    const intermediateY = lastTouchY + dy * (k / steps);
+                    handleInteractionMove(intermediateX, intermediateY); // Вызываем общую функцию движения
+                }
+            } else {
+                 handleInteractionMove(currentTouchX, currentTouchY); // Если дистанция мала, просто обрабатываем точку
+            }
+            
+            lastTouchX = currentTouchX; // Обновляем последнюю позицию касания
+            lastTouchY = currentTouchY;
+
+        }, { passive: false });
+
+        canvas.addEventListener('touchend', (e) => {
+            e.preventDefault();
+            handleInteractionEnd();
+        });
+        canvas.addEventListener('touchcancel', (e) => { // Если система отменила касание
+            e.preventDefault();
+            handleInteractionEnd();
+        });
+
+
+        // Кнопка сброса
+        const resetButton = document.getElementById('resetButton');
+        resetButton.addEventListener('click', () => {
+            fluid.reset(); // Вызов метода сброса симуляции
+        });
+
+
+        // Функция отрисовки
+        function drawFluid() {
+            // Заливаем фон (темно-синий, почти черный)
+            ctx.fillStyle = 'rgb(10,10,20)'; 
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Итерация по сетке для отрисовки плотности
+            for (let i = 0; i < GRID_SIZE; i++) {
+                for (let j = 0; j < GRID_SIZE; j++) {
+                    const density = fluid.density[fluid.IX(i, j)];
+                    // Если плотность очень мала (или 0 после затухания), пропускаем отрисовку этой ячейки
+                    if (density <= 0.01) continue; // Порог для отрисовки, чтобы не рисовать почти невидимые ячейки
+
+                    // Преобразование плотности в цвет
+                    // Цвет: от темно-синего/фиолетового к ярко-голубому/белому
+                    const r = Math.min(255, density * 0.5 + 50);  // Красный компонент
+                    const g = Math.min(255, density * 1.5 + 70);  // Зеленый компонент
+                    const b = Math.min(255, density * 2.5 + 100); // Синий компонент
+                    
+                    ctx.fillStyle = `rgb(${Math.floor(r)}, ${Math.floor(g)}, ${Math.floor(b)})`;
+                    // Отрисовка ячейки с учетом масштаба
+                    ctx.fillRect(i * CANVAS_SCALE, j * CANVAS_SCALE, CANVAS_SCALE, CANVAS_SCALE);
+                }
+            }
+        }
+
+        // Анимационный цикл
+        function animate() {
+            fluid.step(); // Выполняем шаг симуляции
+            drawFluid();  // Отрисовываем результат
+            requestAnimationFrame(animate); // Запрашиваем следующий кадр анимации
+        }
+
+        // Запуск анимации
+        animate();
+
+    </script>
+</body>
+</html>
